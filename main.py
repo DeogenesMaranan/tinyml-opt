@@ -5,8 +5,42 @@ import argparse
 import numpy as np
 import optuna
 import warnings
+import sys
+import threading
 from contextlib import redirect_stderr, redirect_stdout
 import io
+
+# -------------------------------
+# Loading Indicator Utility
+# -------------------------------
+class LoadingIndicator:
+    def __init__(self, message="Loading"):
+        self.message = message
+        self.running = False
+        self.thread = None
+    
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._animate)
+        self.thread.daemon = True
+        self.thread.start()
+    
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join()
+        # Clear the line
+        sys.stdout.write('\r' + ' ' * (len(self.message) + 10) + '\r')
+        sys.stdout.flush()
+    
+    def _animate(self):
+        chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+        i = 0
+        while self.running:
+            sys.stdout.write(f'\r{chars[i % len(chars)]} {self.message}...')
+            sys.stdout.flush()
+            time.sleep(0.1)
+            i += 1
 
 # -------------------------------
 # Configuration and Setup
@@ -21,8 +55,19 @@ def parse_arguments():
 def setup_environment(args):
     """Configure environment variables and logging based on arguments"""
     if not args.verbose:
+        # Comprehensive TensorFlow logging suppression
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+        os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+        os.environ["TFLITE_LOG_LEVEL"] = "3"
+        
+        # Suppress various TensorFlow warnings and info messages
+        os.environ["AUTOGRAPH_VERBOSITY"] = "0"
+        os.environ["TF_DISABLE_MKL"] = "1"
+        
+        # Suppress Python warnings
         warnings.filterwarnings("ignore", category=UserWarning)
+        warnings.filterwarnings("ignore", category=FutureWarning)
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
     
     if args.cpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -30,11 +75,23 @@ def setup_environment(args):
 def setup_tensorflow_logging():
     """Suppress TensorFlow logging if not verbose"""
     import tensorflow as tf
+    
+    # Suppress TensorFlow Python logging
     tf.get_logger().setLevel("ERROR")
     
-    # Suppress absl logging
+    # Suppress absl logging (C++ level)
     import absl.logging
     absl.logging.set_verbosity(absl.logging.ERROR)
+    
+    # Additional TensorFlow C++ logging suppression
+    os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    
+    # Suppress TensorFlow Lite logging
+    os.environ["TFLITE_LOG_LEVEL"] = "3"
+    
+    # Suppress Optuna logging
+    optuna.logging.set_verbosity(optuna.logging.ERROR)
 
 # -------------------------------
 # Data Management
@@ -44,23 +101,31 @@ def load_data():
     import tensorflow as tf
     from tensorflow import keras
     
-    (x_train, y_train), (x_test, y_test) = keras.datasets.mnist.load_data()
+    loader = LoadingIndicator("Loading MNIST dataset")
+    loader.start()
     
-    # Preprocess data
-    x_train = x_train.astype("float32") / 255.0
-    x_test = x_test.astype("float32") / 255.0
-    x_train = np.expand_dims(x_train, -1)
-    x_test = np.expand_dims(x_test, -1)
+    try:
+        (x_train, y_train), (x_test, y_test) = keras.datasets.mnist.load_data()
+        
+        # Preprocess data
+        x_train = x_train.astype("float32") / 255.0
+        x_test = x_test.astype("float32") / 255.0
+        x_train = np.expand_dims(x_train, -1)
+        x_test = np.expand_dims(x_test, -1)
+        
+        # Reduce dataset size for faster experimentation
+        x_train, y_train = x_train[:5000], y_train[:5000]
+        x_test, y_test = x_test[:1000], y_test[:1000]
+        
+        # Convert labels to categorical
+        num_classes = 10
+        y_train = keras.utils.to_categorical(y_train, num_classes)
+        y_test = keras.utils.to_categorical(y_test, num_classes)
+        
+    finally:
+        loader.stop()
     
-    # Reduce dataset size for faster experimentation
-    x_train, y_train = x_train[:5000], y_train[:5000]
-    x_test, y_test = x_test[:1000], y_test[:1000]
-    
-    # Convert labels to categorical
-    num_classes = 10
-    y_train = keras.utils.to_categorical(y_train, num_classes)
-    y_test = keras.utils.to_categorical(y_test, num_classes)
-    
+    print("✓ Dataset loaded and preprocessed")
     return (x_train, y_train), (x_test, y_test), num_classes
 
 # -------------------------------
@@ -111,10 +176,26 @@ def evaluate_tflite(model, x_test_sample, verbose=False):
         # Convert to TFLite with suppressed logging
         converter = tf.lite.TFLiteConverter.from_keras_model(model)
         
+        # Additional converter optimizations and logging suppression
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        
         if not verbose:
-            # Suppress conversion logs
-            with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
-                tflite_model = converter.convert()
+            # Comprehensive log suppression for TFLite conversion
+            stderr_backup = os.dup(2)
+            stdout_backup = os.dup(1)
+            
+            with open(os.devnull, 'w') as devnull:
+                os.dup2(devnull.fileno(), 2)  # Redirect stderr
+                os.dup2(devnull.fileno(), 1)  # Redirect stdout
+                
+                try:
+                    tflite_model = converter.convert()
+                finally:
+                    # Restore original stderr and stdout
+                    os.dup2(stderr_backup, 2)
+                    os.dup2(stdout_backup, 1)
+                    os.close(stderr_backup)
+                    os.close(stdout_backup)
         else:
             tflite_model = converter.convert()
             
@@ -125,9 +206,21 @@ def evaluate_tflite(model, x_test_sample, verbose=False):
         # Get model size
         size_kb = os.path.getsize(tmpfile.name) / 1024.0
         
-        # Measure inference latency
-        interpreter = tf.lite.Interpreter(model_path=tmpfile.name)
-        interpreter.allocate_tensors()
+        # Measure inference latency with suppressed logs
+        if not verbose:
+            stderr_backup = os.dup(2)
+            with open(os.devnull, 'w') as devnull:
+                os.dup2(devnull.fileno(), 2)
+                try:
+                    interpreter = tf.lite.Interpreter(model_path=tmpfile.name)
+                    interpreter.allocate_tensors()
+                finally:
+                    os.dup2(stderr_backup, 2)
+                    os.close(stderr_backup)
+        else:
+            interpreter = tf.lite.Interpreter(model_path=tmpfile.name)
+            interpreter.allocate_tensors()
+            
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
         
@@ -152,30 +245,51 @@ def create_objective(x_train, y_train, x_test, y_test, num_classes, args):
     def objective(trial):
         import tensorflow as tf
         
+        trial_num = trial.number
+        print(f"\nTrial {trial_num:2d}: Building and training model...")
+        
         # Suggest batch size
         batch_size = trial.suggest_categorical("batch_size", [16, 32])
         
-        # Build and train model
+        # Build model
+        build_loader = LoadingIndicator(f"Trial {trial_num} - Building model")
+        build_loader.start()
         model = build_model(trial, (28, 28, 1), num_classes)
+        build_loader.stop()
         
-        # Train with optional verbose output
-        model.fit(
-            x_train, y_train,
-            epochs=1,
-            batch_size=batch_size,
-            validation_split=0.1,
-            verbose=1 if args.verbose else 0
-        )
+        # Train model
+        train_loader = LoadingIndicator(f"Trial {trial_num} - Training model")
+        train_loader.start()
+        try:
+            model.fit(
+                x_train, y_train,
+                epochs=1,
+                batch_size=batch_size,
+                validation_split=0.1,
+                verbose=0  # Always suppress training output for cleaner display
+            )
+        finally:
+            train_loader.stop()
         
         # Evaluate model
-        _, test_acc = model.evaluate(x_test, y_test, verbose=0)
+        eval_loader = LoadingIndicator(f"Trial {trial_num} - Evaluating accuracy")
+        eval_loader.start()
+        try:
+            _, test_acc = model.evaluate(x_test, y_test, verbose=0)
+        finally:
+            eval_loader.stop()
         
         # Evaluate TFLite performance
-        test_sample = np.expand_dims(x_test[0], axis=0).astype(np.float32)
-        size_kb, latency_ms = evaluate_tflite(model, test_sample, args.verbose)
+        tflite_loader = LoadingIndicator(f"Trial {trial_num} - Converting to TFLite")
+        tflite_loader.start()
+        try:
+            test_sample = np.expand_dims(x_test[0], axis=0).astype(np.float32)
+            size_kb, latency_ms = evaluate_tflite(model, test_sample, args.verbose)
+        finally:
+            tflite_loader.stop()
         
         # Print trial results
-        print(f"Trial {trial.number:2d}: acc={test_acc:.4f}, "
+        print(f"Trial {trial_num:2d}: ✓ acc={test_acc:.4f}, "
               f"size={size_kb:6.1f}KB, latency={latency_ms:5.2f}ms")
         
         return test_acc, size_kb, latency_ms
@@ -229,23 +343,40 @@ def main():
     # Load data
     (x_train, y_train), (x_test, y_test), num_classes = load_data()
     
-    print(f"Starting optimization with {args.trials} trials...")
+    print(f"\n🚀 Starting optimization with {args.trials} trials...")
     if args.cpu:
-        print("CPU-only mode enabled")
+        print("💻 CPU-only mode enabled")
     if not args.verbose:
-        print("Logging suppressed (use --verbose for detailed logs)")
-    print("-" * 50)
+        print("🔇 Logging suppressed (use --verbose for detailed logs)")
+    print("-" * 60)
     
-    # Create study and optimize
-    study = optuna.create_study(
-        directions=["maximize", "minimize", "minimize"],
-        study_name="tinyml_nas"
-    )
+    # Create study with loading indicator
+    study_loader = LoadingIndicator("Initializing optimization study")
+    study_loader.start()
+    try:
+        study = optuna.create_study(
+            directions=["maximize", "minimize", "minimize"],
+            study_name="tinyml_nas"
+        )
+        objective_func = create_objective(x_train, y_train, x_test, y_test, num_classes, args)
+    finally:
+        study_loader.stop()
     
-    objective_func = create_objective(x_train, y_train, x_test, y_test, num_classes, args)
+    print("✓ Optimization study initialized")
+    print(f"📊 Progress: Running {args.trials} trials...")
+    
+    # Run optimization
     study.optimize(objective_func, n_trials=args.trials)
     
-    # Display results
+    # Display results with loading indicator
+    results_loader = LoadingIndicator("Analyzing results")
+    results_loader.start()
+    try:
+        time.sleep(0.5)  # Brief pause for effect
+    finally:
+        results_loader.stop()
+    
+    print("\n✓ Optimization completed!")
     print_best_trials(study)
 
 if __name__ == "__main__":
