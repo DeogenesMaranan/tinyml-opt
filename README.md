@@ -1,6 +1,6 @@
-# TinyML Neural Architecture Search
+# TinyML Optimazation
 
-A hyperparameter optimization tool for finding efficient neural network architectures suitable for TinyML applications. This project uses Optuna to automatically search for optimal CNN architectures that balance accuracy, model size, and inference latency.
+Optimizing Lightweight Automated Machine Learning for TinyML Using Bayesian Techniques on Resource-Constrained Devices
 
 ## Features
 

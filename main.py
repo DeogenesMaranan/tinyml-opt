@@ -1,4 +1,4 @@
-"""Neural Architecture Search for TinyML - Main Entry Point"""
+"""TinyML Optimization - Main Entry Point"""
 
 import os
 import sys
