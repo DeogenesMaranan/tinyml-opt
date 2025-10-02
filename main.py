@@ -32,13 +32,22 @@ def main():
     if args.cpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     
-    # Now import modules (TensorFlow logging should be suppressed)
-    from src.utils.config import setup_tensorflow_logging
-    from src.data.loader import load_data
-    from src.optimization.optimizer import run_optimization
+    # Show loading indicator during initial setup
+    from src.utils.loading import LoadingIndicator
     
-    # Additional TensorFlow logging setup
-    setup_tensorflow_logging()
+    setup_loader = LoadingIndicator("Initializing TensorFlow and dependencies")
+    setup_loader.start()
+    
+    try:
+        # Now import modules (TensorFlow logging should be suppressed)
+        from src.utils.config import setup_tensorflow_logging
+        from src.data.loader import load_data
+        from src.optimization.optimizer import run_optimization
+        
+        # Additional TensorFlow logging setup
+        setup_tensorflow_logging()
+    finally:
+        setup_loader.stop()
     
     # Load data
     (x_train, y_train), (x_test, y_test), num_classes = load_data()
